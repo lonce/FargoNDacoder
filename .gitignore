@@ -1,0 +1,42 @@
+output_keep/
+data/*
+!data/.gitkeep
+output/
+!output/.gitkeep
+scratch/
+.ipynb_checkpoints/
+/runs
+old/
+artifacts/
+synth/
+
+**/output_*
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+.wheelhouse/
+
+
+# Jupyter
+.ipynb_checkpoints/
+
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+synth/

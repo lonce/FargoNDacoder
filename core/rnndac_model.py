@@ -24,8 +24,12 @@ class GRUModelConfig:
 
     # embeddings / projections
     input_embed_size: int = 128
-    cond_embed_size: int = 0      # only used for concat mode when > 0
+    cond_embed_size: int = 0      # deprecated — use inp_proportion/cond_proportion instead
     film_hidden_size: int = 128   # only used for film mode
+
+    # proportion of the 128 GRU input dimensions devoted to latent vs cond (concat mode)
+    inp_proportion: int = 5
+    cond_proportion: int = 2
 
     # recurrent core
     hidden_size: int = 128
@@ -168,22 +172,22 @@ class RNNDACModel(nn.Module):
 
         self.register_buffer("codebook_vectors", codebook_vectors.float())
 
-        self.input_proj = nn.Linear(config.input_size, config.input_embed_size)
-
         if config.cond_injection == "concat":
             if config.cond_size > 0:
-                if config.cond_embed_size > 0:
-                    self.cond_proj = nn.Linear(config.cond_size, config.cond_embed_size)
-                    gru_input_size = config.input_embed_size + config.cond_embed_size
-                else:
-                    self.cond_proj = None
-                    gru_input_size = config.input_embed_size + config.cond_size
+                total_slots = config.inp_proportion + config.cond_proportion
+                lpn = config.inp_proportion * config.input_embed_size // total_slots
+                lcn = config.input_embed_size - lpn
+                self.latent_proj = nn.Linear(config.input_size, lpn)
+                self.cond_proj = nn.Linear(config.cond_size, lcn)
+                gru_input_size = lpn + lcn
             else:
+                self.latent_proj = nn.Linear(config.input_size, config.input_embed_size)
                 self.cond_proj = None
                 gru_input_size = config.input_embed_size
             self.film = None
         else:  # film
             self.cond_proj = None
+            self.latent_proj = nn.Linear(config.input_size, config.input_embed_size)
             gru_input_size = config.input_embed_size
             self.film = (
                 FiLMBlock(config.cond_size, config.input_embed_size, config.film_hidden_size)
@@ -205,13 +209,13 @@ class RNNDACModel(nn.Module):
         ])
 
     def _prepare_inputs(self, latents: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
-        x = self.input_proj(latents)
+        x = self.latent_proj(latents)
 
         if self.config.cond_injection == "concat":
             if self.config.cond_size > 0:
                 if cond is None:
                     raise ValueError("cond is required when cond_size > 0")
-                cond_feat = self.cond_proj(cond) if self.cond_proj is not None else cond
+                cond_feat = self.cond_proj(cond)
                 x = torch.cat([x, cond_feat], dim=-1)
         else:  # film
             if self.film is not None:

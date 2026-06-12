@@ -47,8 +47,11 @@ def generate_latent_hop(
     for t in range(hop_size):
         cond_t = cond_hop[:, t, :]  # [B, p]
 
+        # Normalize to [-1, 1] to match training-time input distribution
+        normed_latent_t = torch.clamp(latent_t, -rnn_model.config.clamp_val,
+                                       rnn_model.config.clamp_val) / rnn_model.config.clamp_val
         out = rnn_model.forward_step(
-            latent_t=latent_t,
+            latent_t=normed_latent_t,
             cond_t=cond_t,
             hidden=hidden,
             cascade_mode="soft",   # IMPORTANT

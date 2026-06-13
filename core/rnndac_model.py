@@ -39,6 +39,10 @@ class GRUModelConfig:
     # conditioning
     cond_injection: CondInjection = "concat"
 
+    # soft cascade tuning
+    tau_soft: float = 1.0          # temperature for soft cascade softmax (<1 sharpens)
+    top_n_soft: int = 0            # 0 = no sparsification; >0 keeps only top-k logits
+
     # bookkeeping
     model_version: str = "rnndac_v1"
 
@@ -225,6 +229,12 @@ class RNNDACModel(nn.Module):
         return x
 
     def _expected_vector(self, logits: torch.Tensor, q_idx: int) -> torch.Tensor:
+        logits = logits / self.config.tau_soft
+        if self.config.top_n_soft > 0:
+            values, indices = torch.topk(logits, self.config.top_n_soft, dim=-1)
+            masked = torch.full_like(logits, float('-inf'))
+            masked.scatter_(dim=-1, index=indices, src=values)
+            logits = masked
         probs = F.softmax(logits, dim=-1)
         codebook = self.codebook_vectors[q_idx]  # [K, D]
         return probs @ codebook

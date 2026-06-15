@@ -207,8 +207,9 @@ class RNNDACModel(nn.Module):
             batch_first=True,
         )
 
+        head_cond_dim = config.cond_size if config.cond_size > 0 else 0
         self.heads = nn.ModuleList([
-            nn.Linear(config.hidden_size + i * config.codebook_dim, config.codebook_size)
+            nn.Linear(config.hidden_size + head_cond_dim + i * config.codebook_dim, config.codebook_size)
             for i in range(config.n_q)
         ])
 
@@ -273,12 +274,14 @@ class RNNDACModel(nn.Module):
         rnn_out: torch.Tensor,
         cascade_mode: CascadeMode,
         target_codes: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Args:
             rnn_out: [B, T, H]
             cascade_mode: 'teacher' | 'soft' | 'hard'
             target_codes: [B, T, n_q], required when teacher forcing is used
+            cond: [B, T, cond_size] or None
 
         Returns:
             logits_per_q: list of n_q tensors, each [B, T, K]
@@ -288,6 +291,7 @@ class RNNDACModel(nn.Module):
         N = B * T
 
         rnn_flat = rnn_out.reshape(N, H)
+        cond_flat = cond.reshape(N, -1) if cond is not None else None
         teacher_flat = None
         if cascade_mode == "teacher":
             if target_codes is None:
@@ -299,11 +303,13 @@ class RNNDACModel(nn.Module):
         vecs_per_q_flat: List[torch.Tensor] = []
 
         for q in range(self.config.n_q):
-            if q == 0:
-                head_in = rnn_flat
-            else:
+            parts = [rnn_flat]
+            if cond_flat is not None:
+                parts.append(cond_flat)
+            if q > 0:
                 prev_vecs = torch.cat(vecs_per_q_flat, dim=-1)  # [N, q * D]
-                head_in = torch.cat([rnn_flat, prev_vecs], dim=-1)
+                parts.append(prev_vecs)
+            head_in = torch.cat(parts, dim=-1)
 
             logits_q = self.heads[q](head_in)  # [N, K]
             logits_per_q_flat.append(logits_q)
@@ -380,6 +386,7 @@ class RNNDACModel(nn.Module):
             rnn_out,
             cascade_mode=cascade_mode,
             target_codes=target_codes,
+            cond=cond,
         )
 
         return {
@@ -490,9 +497,10 @@ class RNNDACModelNoCascade(RNNDACModel):
         super().__init__(config=config, dac_model=dac_model, codebook_vectors=codebook_vectors)
 
         # Replace the variable-width cascade heads from the base class with
-        # fixed-width heads that depend only on the GRU output.
+        # fixed-width heads that depend only on the GRU output and cond.
+        head_cond_dim = config.cond_size if config.cond_size > 0 else 0
         self.heads = nn.ModuleList([
-            nn.Linear(config.hidden_size, config.codebook_size)
+            nn.Linear(config.hidden_size + head_cond_dim, config.codebook_size)
             for _ in range(config.n_q)
         ])
 
@@ -501,6 +509,7 @@ class RNNDACModelNoCascade(RNNDACModel):
         rnn_out: torch.Tensor,
         cascade_mode: CascadeMode,
         target_codes: Optional[torch.Tensor] = None,
+        cond: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Predict each codebook independently from the shared RNN representation.
@@ -509,6 +518,7 @@ class RNNDACModelNoCascade(RNNDACModel):
             rnn_out: [B, T, H]
             cascade_mode: accepted for API compatibility, ignored
             target_codes: accepted for API compatibility, ignored
+            cond: [B, T, cond_size] or None
 
         Returns:
             logits_per_q: list of n_q tensors, each [B, T, K]
@@ -519,12 +529,17 @@ class RNNDACModelNoCascade(RNNDACModel):
         B, T, H = rnn_out.shape
         N = B * T
         rnn_flat = rnn_out.reshape(N, H)
+        cond_flat = cond.reshape(N, -1) if cond is not None else None
 
         logits_per_q_flat: List[torch.Tensor] = []
         vecs_per_q_flat: List[torch.Tensor] = []
 
         for q in range(self.config.n_q):
-            logits_q = self.heads[q](rnn_flat)  # [N, K]
+            parts = [rnn_flat]
+            if cond_flat is not None:
+                parts.append(cond_flat)
+            head_in = torch.cat(parts, dim=-1)
+            logits_q = self.heads[q](head_in)  # [N, K]
             logits_per_q_flat.append(logits_q)
 
             # Returned for inspection/debugging only; not used by any later head.

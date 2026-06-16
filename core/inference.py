@@ -26,8 +26,9 @@ def generate_latent_hop(
     latent_t,           # [B, n_q*8]
     cond_hop,           # [B, hop_size, p]
     hidden,
-    top_k=1,
-    temperature=1.0,
+    top_k=5,
+    temperature=0.5,
+    cascade_mode="soft",
 ):
     """
     Generate hop_size frames autoregressively.
@@ -54,7 +55,7 @@ def generate_latent_hop(
             latent_t=normed_latent_t,
             cond_t=cond_t,
             hidden=hidden,
-            cascade_mode="soft",   # IMPORTANT
+            cascade_mode=cascade_mode,
         )
 
         logits_per_q = out["logits_per_codebook"]
@@ -103,8 +104,8 @@ def infer_streaming_with_lookahead(
     chunk_size,
     hop_size,
     right_context,
-    top_k=1,
-    temperature=1.0,
+    top_k=5,
+    temperature=0.5,
     frame_samples=512,
 ):
     """

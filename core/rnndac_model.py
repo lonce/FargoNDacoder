@@ -43,6 +43,9 @@ class GRUModelConfig:
     tau_soft: float = 1.0          # temperature for soft cascade softmax (<1 sharpens)
     top_n_soft: int = 0            # 0 = no sparsification; >0 keeps only top-k logits
 
+    # free-run training
+    free_run_window: int = 32      # frames per free-run autoregressive segment
+
     # bookkeeping
     model_version: str = "rnndac_v1"
 
@@ -428,6 +431,92 @@ class RNNDACModel(nn.Module):
             cascade_mode=cascade_mode,
             return_expected_vectors=return_expected_vectors,
         )
+
+    def free_run_forward(
+        self,
+        latent_seed: torch.Tensor,
+        cond_seq: torch.Tensor,
+        target_codes: torch.Tensor,
+        quantizer_weights: Optional[torch.Tensor] = None,
+        cascade_mode: CascadeMode = "soft",
+    ) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
+        """
+        Free-running autoregressive forward pass for training.
+
+        Unlike the normal batched forward, each timestep's input is the
+        previous step's predicted codebook vector with straight-through
+        estimation:
+          - Forward: discrete (argmax) codebook vectors → matches the
+            training distribution the GRU expects.
+          - Backward: gradient flows through soft expected vectors →
+            fully differentiable.
+
+        Args:
+            latent_seed: [B, n_q * codebook_dim]  ground-truth first-frame
+                          latents (detached, already at dataset norm scale).
+            cond_seq:    [B, T, cond_size]         conditioning sequence.
+            target_codes: [B, T, n_q]              ground-truth code indices.
+            quantizer_weights: [n_q] or None.
+            cascade_mode: "soft" or "hard" (teacher not supported here).
+
+        Returns:
+            Same dict as compute_loss: {"total_loss", "per_codebook_losses"}.
+        """
+        B, T, _ = cond_seq.shape
+        T = min(T, self.config.free_run_window)
+        n_q = self.config.n_q
+        device = latent_seed.device
+
+        all_logits: List[List[torch.Tensor]] = [[] for _ in range(n_q)]
+
+        # Seed is already normalised by the dataset (raw_latent / clamp_val).
+        # Do NOT divide again — the GRU expects the dataset-normalised scale.
+        latent_t = torch.clamp(latent_seed, -1.0, 1.0)
+
+        hidden: Optional[torch.Tensor] = None
+
+        for t in range(T):
+            cond_t = cond_seq[:, t, :]  # [B, cond_size]
+
+            out = self.forward(
+                latents=latent_t.unsqueeze(1),                # [B, 1, D]
+                cond=cond_t.unsqueeze(1),                     # [B, 1, C]
+                hidden=hidden,
+                cascade_mode=cascade_mode,
+                return_expected_vectors=True,
+            )
+
+            hidden = out["hidden"]
+
+            for q in range(n_q):
+                all_logits[q].append(out["logits_per_codebook"][q])  # [B, 1, K]
+
+            # Build next-step GRU input using straight-through estimation.
+            # Forward pass: discrete (argmax) codebook vectors → matches training distribution.
+            # Backward pass: gradient flows through soft expected vectors → differentiable.
+            vecs_soft = out["expected_vectors_per_codebook"]  # n_q × [B, 1, 8]
+            latent_t_soft = torch.cat(vecs_soft, dim=-1).squeeze(1)  # [B, 72]
+
+            hard_vecs = []
+            for q in range(n_q):
+                logits_q = out["logits_per_codebook"][q]  # [B, 1, K]
+                hard_vec = self._hard_vector(logits_q.squeeze(1), q)  # [B, 8]
+                hard_vecs.append(hard_vec)
+            latent_t_hard = torch.cat(hard_vecs, dim=-1)  # [B, 72]
+
+            latent_t = latent_t_hard.detach() + latent_t_soft - latent_t_soft.detach()
+
+            latent_t = torch.clamp(
+                latent_t, -self.config.clamp_val, self.config.clamp_val
+            ) / self.config.clamp_val
+
+        # Stack per-timestep logits → standard [B, T, K]
+        stacked_logits = [
+            torch.cat(q_list, dim=1) for q_list in all_logits
+        ]
+        stacked_targets = target_codes[:, :T, :]
+
+        return self.compute_loss(stacked_logits, stacked_targets, quantizer_weights)
 
     def compute_loss(
         self,

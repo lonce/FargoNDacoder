@@ -1,5 +1,128 @@
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn.functional as F
+
+
+CodePool = List[List[Tuple[torch.Tensor, torch.Tensor]]]
+"""
+pool[b][q] -> (vectors, indices)
+    vectors: [N_bq, 8]    unique 8D codebook vectors at this cond bin
+    indices: [N_bq]        corresponding codebook indices
+"""
+
+
+def build_code_pool(
+    dataset,
+    n_bins: int = 100,
+    cond_index: int = 0,
+    n_q_for_pool: int = 1,
+) -> CodePool:
+    """
+    One-pass pool builder: iterate dataset, bin cond values,
+    record observed 8D DAC codebook vectors per codebook level.
+
+    The pool stores the *actual 8D vectors* from the dataset's latents
+    (already projected to DAC latent space), so Euclidean distance
+    comparisons are meaningful.
+
+    Args:
+        dataset: RNNDACLatentDataset (training split).
+        n_bins: number of bins for cond values (assumed in [0, 1]).
+        cond_index: which column of cond to bin by.
+        n_q_for_pool: number of codebook levels to record (default 1 = CB0 only).
+
+    Returns:
+        CodePool: pool[b][q] = (vectors, indices)
+    """
+    D = 8  # codebook_dim
+    pool: CodePool = [[(torch.empty(0, D), torch.empty(0, dtype=torch.long))
+                        for _ in range(n_q_for_pool)] for _ in range(n_bins)]
+
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        cond = sample["cond"]           # [T, p]
+        latents = sample["latents"]     # [T, n_q * D]
+        targets = sample["targets"]     # [T, n_q]
+
+        T = cond.shape[0]
+        for t in range(T):
+            bin_idx = int(cond[t, cond_index].item() * n_bins)
+            bin_idx = min(max(bin_idx, 0), n_bins - 1)
+            for q in range(n_q_for_pool):
+                vec = latents[t, q * D : (q + 1) * D]  # [D]
+                idx = int(targets[t, q].item())
+                cur_vecs, cur_idxs = pool[bin_idx][q]
+                if cur_vecs.shape[0] == 0 or not (vec == cur_vecs).all(dim=1).any():
+                    pool[bin_idx][q] = (
+                        torch.cat([cur_vecs, vec.unsqueeze(0)]),
+                        torch.cat([cur_idxs, torch.tensor([idx])]),
+                    )
+
+    return pool
+
+
+def pool_snap(
+    pool: CodePool,
+    expected_vec: torch.Tensor,
+    cond_values: torch.Tensor,
+    n_bins: int,
+    widen: int = 1,
+    q: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Snap expected 8D vectors to nearest pool vectors in Euclidean space.
+
+    Args:
+        pool: from build_code_pool.
+        expected_vec: [B, 8] soft expected vector from logits @ codebook.
+        cond_values: [B] float tensor of cond values in [0, 1].
+        n_bins: number of bins used when building pool.
+        widen: adjacent bins to include on each side.
+        q: codebook level to snap.
+
+    Returns:
+        (snapped_vecs, snapped_idxs): each [B, 8] and [B].
+    """
+    B = expected_vec.shape[0]
+    device = expected_vec.device
+
+    snapped_vecs = torch.zeros_like(expected_vec)
+    snapped_idxs = torch.zeros(B, dtype=torch.long, device=device)
+
+    for bi in range(B):
+        cv = cond_values[bi].item()
+        bin_idx = int(cv * n_bins)
+        bin_idx = min(max(bin_idx, 0), n_bins - 1)
+        lo = max(0, bin_idx - widen)
+        hi = min(n_bins - 1, bin_idx + widen)
+
+        all_vecs = []
+        all_idxs = []
+        for b in range(lo, hi + 1):
+            vecs, idxs = pool[b][q]
+            if vecs.shape[0] > 0:
+                all_vecs.append(vecs)
+                all_idxs.append(idxs)
+
+        if not all_vecs:
+            # No pool vectors available — return the expected vector unchanged
+            snapped_vecs[bi] = expected_vec[bi]
+            snapped_idxs[bi] = -1
+            continue
+
+        pool_vecs = torch.cat(all_vecs, dim=0).to(device)  # [M, 8]
+        pool_idxs = torch.cat(all_idxs, dim=0).to(device)   # [M]
+
+        # Euclidean distance
+        diff = expected_vec[bi:bi+1] - pool_vecs
+        dist = diff.square().sum(dim=1)  # [M]
+        nn = dist.argmin()
+
+        snapped_vecs[bi] = pool_vecs[nn]
+        snapped_idxs[bi] = pool_idxs[nn]
+
+    return snapped_vecs, snapped_idxs
 
 
 def sample_logits_topk(logits, top_k=1, temperature=1.0):
@@ -29,9 +152,17 @@ def generate_latent_hop(
     top_k=5,
     temperature=0.5,
     cascade_mode="soft",
+    pool=None,
+    pool_cond_index=0,
+    pool_n_bins=100,
+    pool_widen=1,
 ):
     """
     Generate hop_size frames autoregressively.
+
+    If pool is provided, CB0 expected 8D vectors (from logits) are snapped
+    to the nearest observed pool vector in Euclidean space.  This keeps
+    CB0 in-distribution for the current conditioning value.
 
     Returns:
         latents_out: [B, hop_size, n_q*8]
@@ -67,17 +198,26 @@ def generate_latent_hop(
         for q, logits_q in enumerate(logits_per_q):
             # logits_q: [B, 1, K] → flatten
             logits_q = logits_q.squeeze(1)
+            codebook = rnn_model.codebook_vectors[q]  # [K, 8]
 
-            idx = sample_logits_topk(
-                logits_q,
-                top_k=top_k,
-                temperature=temperature,
-            )
+            if pool is not None and q == 0:
+                # Soft expected 8D vector → snap to nearest pool vector
+                probs = torch.softmax(logits_q, dim=-1)
+                expected_vec = probs @ codebook  # [B, 8]
+                cond_vals = cond_t[:, pool_cond_index]  # [B]
+                vec_q, idx = pool_snap(
+                    pool, expected_vec, cond_vals,
+                    pool_n_bins, widen=pool_widen, q=0,
+                )
+            else:
+                idx = sample_logits_topk(
+                    logits_q,
+                    top_k=top_k,
+                    temperature=temperature,
+                )
+                vec_q = codebook[idx]  # [B, 8]
 
             codes_t.append(idx)
-
-            codebook = rnn_model.codebook_vectors[q]  # [K, 8]
-            vec_q = codebook[idx]                     # [B, 8]
             vecs_t.append(vec_q)
 
         # stack codebooks → [B, n_q, 8]
@@ -107,6 +247,10 @@ def infer_streaming_with_lookahead(
     top_k=5,
     temperature=0.5,
     frame_samples=512,
+    pool=None,
+    pool_cond_index=0,
+    pool_n_bins=100,
+    pool_widen=1,
 ):
     """
     Full streaming RNNDAC inference.
@@ -141,6 +285,10 @@ def infer_streaming_with_lookahead(
         hidden,
         top_k=top_k,
         temperature=temperature,
+        pool=pool,
+        pool_cond_index=pool_cond_index,
+        pool_n_bins=pool_n_bins,
+        pool_widen=pool_widen,
     )
 
     latent_buffer.append(init_latents)
@@ -163,6 +311,10 @@ def infer_streaming_with_lookahead(
             hidden,
             top_k=top_k,
             temperature=temperature,
+            pool=pool,
+            pool_cond_index=pool_cond_index,
+            pool_n_bins=pool_n_bins,
+            pool_widen=pool_widen,
         )
 
         latent_buffer.append(new_latents)

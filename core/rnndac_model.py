@@ -207,9 +207,8 @@ class RNNDACModel(nn.Module):
             batch_first=True,
         )
 
-        head_cond_dim = config.cond_size if config.cond_size > 0 else 0
         self.heads = nn.ModuleList([
-            nn.Linear(config.hidden_size + head_cond_dim + i * config.codebook_dim, config.codebook_size)
+            nn.Linear(config.hidden_size + i * config.codebook_dim, config.codebook_size)
             for i in range(config.n_q)
         ])
 
@@ -274,14 +273,12 @@ class RNNDACModel(nn.Module):
         rnn_out: torch.Tensor,
         cascade_mode: CascadeMode,
         target_codes: Optional[torch.Tensor] = None,
-        cond: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Args:
             rnn_out: [B, T, H]
             cascade_mode: 'teacher' | 'soft' | 'hard'
             target_codes: [B, T, n_q], required when teacher forcing is used
-            cond: [B, T, cond_size] or None
 
         Returns:
             logits_per_q: list of n_q tensors, each [B, T, K]
@@ -291,7 +288,6 @@ class RNNDACModel(nn.Module):
         N = B * T
 
         rnn_flat = rnn_out.reshape(N, H)
-        cond_flat = cond.reshape(N, -1) if cond is not None else None
         teacher_flat = None
         if cascade_mode == "teacher":
             if target_codes is None:
@@ -304,8 +300,6 @@ class RNNDACModel(nn.Module):
 
         for q in range(self.config.n_q):
             parts = [rnn_flat]
-            if cond_flat is not None:
-                parts.append(cond_flat)
             if q > 0:
                 prev_vecs = torch.cat(vecs_per_q_flat, dim=-1)  # [N, q * D]
                 parts.append(prev_vecs)
@@ -386,7 +380,6 @@ class RNNDACModel(nn.Module):
             rnn_out,
             cascade_mode=cascade_mode,
             target_codes=target_codes,
-            cond=cond,
         )
 
         return {

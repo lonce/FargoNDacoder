@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-CascadeMode = Literal["teacher", "soft", "hard"]
+CascadeMode = Literal["teacher", "free"]
 CondInjection = Literal["concat", "film"]
 
 
@@ -35,13 +35,13 @@ class GRUModelConfig:
     hidden_size: int = 128
     num_layers: int = 3
     dropout: float = 0.1
+    rnn_dropout: float = 0.0       # dropout applied to GRU output before cascade (training only)
+
+    # classification (logits over codebook entries instead of 8D regression)
+    tau: float = 1.0               # softmax temperature for codebook prediction
 
     # conditioning
     cond_injection: CondInjection = "concat"
-
-    # soft cascade tuning
-    tau_soft: float = 1.0          # temperature for soft cascade softmax (<1 sharpens)
-    top_n_soft: int = 0            # 0 = no sparsification; >0 keeps only top-k logits
 
     # bookkeeping
     model_version: str = "rnndac_v1"
@@ -101,6 +101,10 @@ class RNNDACModel(nn.Module):
     """
     GRU-based DAC code predictor with per-timestep codebook cascade.
 
+    Each cascade head predicts logits over 1024 codebook entries (classification).
+    During training, softmax with temperature tau provides differentiable
+    weights for codebook mixing. During inference, argmax picks the hard index.
+
     Input:
       latents: [B, T, n_q * 8]   (stacked, normalized/clamped)
       cond:    [B, T, p]
@@ -108,7 +112,7 @@ class RNNDACModel(nn.Module):
                                   and required inside the model when cascade_mode='teacher')
 
     Output:
-      logits_per_codebook: list of n_q tensors, each [B, T, codebook_size]
+      predicted_logits_per_codebook: list of n_q tensors, each [B, T, 1024]
 
     Cascade at each timestep:
       head 0 input = rnn_out[t]
@@ -117,11 +121,11 @@ class RNNDACModel(nn.Module):
       ...
 
     where vec_i is chosen according to cascade_mode:
-      - teacher: target 8D vector obtained by looking up target_codes in codebook_vectors
-      - soft:    expected 8D vector from logits + codebook embeddings
-      - hard:    argmax-selected 8D vector from codebook embeddings
+      - teacher: target vector obtained by looking up target_codes in codebook_vectors
+      - free:    softmax-weighted (train) or argmax (eval) codebook vector
 
-    Sampling for autoregressive deployment is intentionally kept outside this model.
+    Inference uses cascade_mode='free': argmax picks the codebook index,
+    and the resulting vector (normalized) is fed back to the next head.
     """
 
     def __init__(
@@ -212,6 +216,8 @@ class RNNDACModel(nn.Module):
             for i in range(config.n_q)
         ])
 
+        self.rnn_dropout = nn.Dropout(config.rnn_dropout) if config.rnn_dropout > 0 else nn.Identity()
+
     def _prepare_inputs(self, latents: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
         x = self.latent_proj(latents)
 
@@ -227,22 +233,6 @@ class RNNDACModel(nn.Module):
                     raise ValueError("cond is required when cond_size > 0")
                 x = self.film(x, cond)
         return x
-
-    def _expected_vector(self, logits: torch.Tensor, q_idx: int) -> torch.Tensor:
-        logits = logits / self.config.tau_soft
-        if self.config.top_n_soft > 0:
-            values, indices = torch.topk(logits, self.config.top_n_soft, dim=-1)
-            masked = torch.full_like(logits, float('-inf'))
-            masked.scatter_(dim=-1, index=indices, src=values)
-            logits = masked
-        probs = F.softmax(logits, dim=-1)
-        codebook = self.codebook_vectors[q_idx]  # [K, D]
-        return probs @ codebook
-
-    def _hard_vector(self, logits: torch.Tensor, q_idx: int) -> torch.Tensor:
-        idx = torch.argmax(logits, dim=-1)  # [N]
-        codebook = self.codebook_vectors[q_idx]  # [K, D]
-        return codebook[idx]
 
     def _teacher_vectors_from_codes(self, target_codes: torch.Tensor) -> torch.Tensor:
         """
@@ -273,56 +263,180 @@ class RNNDACModel(nn.Module):
         rnn_out: torch.Tensor,
         cascade_mode: CascadeMode,
         target_codes: Optional[torch.Tensor] = None,
+        tau: Optional[float] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
+        Predict codebook indices via logits, with differentiable codebook
+        mixing using softmax temperature tau.
+
         Args:
             rnn_out: [B, T, H]
-            cascade_mode: 'teacher' | 'soft' | 'hard'
-            target_codes: [B, T, n_q], required when teacher forcing is used
+            cascade_mode: 'teacher' | 'free'
+            target_codes: [B, T, n_q], required when cascade_mode='teacher'
+            tau: softmax temperature (default: self.config.tau)
 
         Returns:
-            logits_per_q: list of n_q tensors, each [B, T, K]
-            cascade_vectors_per_q: list of n_q tensors, each [B, T, D]
+            logits_per_q: list of n_q tensors, each [B, T, codebook_size]
+            cascade_vectors: list of n_q tensors, each [B, T, codebook_dim]
+                             (normalized to [-1,1])
         """
+        cfg = self.config
         B, T, H = rnn_out.shape
-        N = B * T
+        tau = tau if tau is not None else cfg.tau
 
-        rnn_flat = rnn_out.reshape(N, H)
         teacher_flat = None
         if cascade_mode == "teacher":
             if target_codes is None:
                 raise ValueError("target_codes is required when cascade_mode='teacher'")
-            teacher = self._teacher_vectors_from_codes(target_codes)
-            teacher_flat = teacher.reshape(N, self.config.n_q, self.config.codebook_dim)
+            teacher = self._teacher_vectors_from_codes(target_codes)  # [B, T, n_q, D]
+            teacher_flat = teacher.reshape(-1, cfg.n_q, cfg.codebook_dim)  # [N, n_q, D]
 
-        logits_per_q_flat: List[torch.Tensor] = []
-        vecs_per_q_flat: List[torch.Tensor] = []
+        logits_per_q: List[torch.Tensor] = []
+        cascade_vectors: List[torch.Tensor] = []
 
-        for q in range(self.config.n_q):
-            parts = [rnn_flat]
+        for q in range(cfg.n_q):
+            parts = [rnn_out]  # [B, T, H]
             if q > 0:
-                prev_vecs = torch.cat(vecs_per_q_flat, dim=-1)  # [N, q * D]
-                parts.append(prev_vecs)
-            head_in = torch.cat(parts, dim=-1)
+                prev = torch.cat(cascade_vectors, dim=-1)  # [B, T, q*D]
+                parts.append(prev * cfg.clamp_val)          # undo normalization
+            head_in = torch.cat(parts, dim=-1)  # [B, T, H + q*D]
 
-            logits_q = self.heads[q](head_in)  # [N, K]
-            logits_per_q_flat.append(logits_q)
+            logits_q = self.heads[q](head_in)  # [B, T, K]
+            logits_per_q.append(logits_q)
 
-            if cascade_mode == "teacher":
-                assert teacher_flat is not None
-                vec_q = teacher_flat[:, q, :]
-            elif cascade_mode == "soft":
-                vec_q = self._expected_vector(logits_q, q)
-            elif cascade_mode == "hard":
-                vec_q = self._hard_vector(logits_q, q)
+            # Derive cascade vectors for next head
+            if cascade_mode == "teacher" and teacher_flat is not None:
+                N = B * T
+                vec_raw = teacher_flat[:, q, :].reshape(B, T, -1)  # [B, T, D]
+            elif self.training:
+                probs = F.softmax(logits_q / tau, dim=-1)           # [B, T, K]
+                vec_raw = probs @ self.codebook_vectors[q]          # [B, T, D]
             else:
-                raise ValueError(f"Unsupported cascade_mode: {cascade_mode}")
+                idx = logits_q.argmax(dim=-1)                        # [B, T]
+                vec_raw = self.codebook_vectors[q][idx]              # [B, T, D]
 
-            vecs_per_q_flat.append(vec_q)
+            cascade_vectors.append(vec_raw / cfg.clamp_val)
 
-        logits_per_q = [x.reshape(B, T, self.config.codebook_size) for x in logits_per_q_flat]
-        vecs_per_q = [x.reshape(B, T, self.config.codebook_dim) for x in vecs_per_q_flat]
-        return logits_per_q, vecs_per_q
+        return logits_per_q, cascade_vectors
+
+    def forward_autoregressive(
+        self,
+        latents: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        target_codes: Optional[torch.Tensor] = None,
+        warmup_steps: int = 0,
+        tau: Optional[float] = None,
+    ) -> Dict[str, torch.Tensor | List[torch.Tensor] | None]:
+        """
+        Autoregressive forward pass for scheduled sampling during training.
+
+        Phase 1 (warmup): batched forward with ground-truth latents for the
+        first `warmup_steps` frames.  All predictions are from 'free' cascade.
+
+        Phase 2 (autoregressive): for each remaining frame the GRU input is
+        the *model's own* predicted latent from the previous frame — exactly as
+        during inference.  The cascade is always 'free'.
+
+        Args:
+            latents: [B, T, n_q * codebook_dim]  (ground truth, used for warmup)
+            cond: [B, T, cond_size]
+            target_codes: [B, T, n_q]  (used only for loss outside, not forced)
+            warmup_steps: number of initial frames that receive GT GRU input.
+            tau: softmax temperature (default: self.config.tau)
+
+        Returns:
+            Same dict as forward().
+        """
+        B, T, D = latents.shape
+        if warmup_steps < 0 or warmup_steps > T:
+            raise ValueError(f"warmup_steps must be in [0, T={T}], got {warmup_steps}")
+        if cond is not None:
+            if cond.shape[:2] != (B, T):
+                raise ValueError("cond and latents must agree on [B, T]")
+
+        # ------------------------------------------------------------------
+        # Phase 1 — warmup (batched, GT input, free cascade)
+        # ------------------------------------------------------------------
+        warmup_logits_per_q: List[torch.Tensor] = []
+        warmup_hidden = None
+
+        if warmup_steps > 0:
+            out_warmup = self.forward(
+                latents=latents[:, :warmup_steps, :],
+                cond=cond[:, :warmup_steps, :] if cond is not None else None,
+                cascade_mode="free",
+                tau=tau,
+            )
+            warmup_logits_per_q = out_warmup["predicted_logits_per_codebook"]
+            warmup_cascade_vectors = out_warmup["cascade_vectors"]
+            warmup_hidden = out_warmup["hidden"]
+        else:
+            # Seed step: use first GT frame as GRU input, predict frame 0.
+            cond_0 = cond[:, 0:1, :] if cond is not None else None
+            x_0 = self._prepare_inputs(latents[:, 0:1, :], cond_0)
+            rnn_0, hidden_seed = self.gru(x_0, None)
+            rnn_0 = self.rnn_dropout(rnn_0)
+            logits_0, cascade_vecs_0 = self._run_codebook_cascade(
+                rnn_0, cascade_mode="free", tau=tau,
+            )
+            warmup_logits_per_q = logits_0          # list of [B, 1, K]
+            warmup_cascade_vectors = cascade_vecs_0  # list of [B, 1, D]
+            warmup_hidden = hidden_seed
+            warmup_steps = 1  # step 0 is done
+
+        # ------------------------------------------------------------------
+        # Phase 2 — autoregressive
+        # ------------------------------------------------------------------
+        autoreg_logits: List[List[torch.Tensor]] = [
+            [] for _ in range(self.config.n_q)
+        ]
+        hidden = warmup_hidden
+
+        # The last cascade vectors from warmup become the first AR input
+        last_pred_flat = torch.cat(
+            [warmup_cascade_vectors[q][:, -1:, :] for q in range(self.config.n_q)],
+            dim=-1,
+        )  # [B, 1, D]  (normalized vectors)
+
+        for t in range(warmup_steps, T):
+            cond_t = cond[:, t : t + 1, :] if cond is not None else None
+            x_t = self._prepare_inputs(last_pred_flat, cond_t)
+
+            rnn_t, hidden = self.gru(x_t, hidden)
+            rnn_t = self.rnn_dropout(rnn_t)
+
+            logits_t, cascade_vecs_t = self._run_codebook_cascade(
+                rnn_t, cascade_mode="free", tau=tau,
+            )
+            for q in range(self.config.n_q):
+                autoreg_logits[q].append(logits_t[q])
+
+            last_pred_flat = torch.cat(
+                [cascade_vecs_t[q] for q in range(self.config.n_q)], dim=-1
+            )
+
+        # ------------------------------------------------------------------
+        # Concatenate warmup + autoregressive logits
+        # ------------------------------------------------------------------
+        all_logits_per_q: List[torch.Tensor] = []
+        for q in range(self.config.n_q):
+            warmup_q = warmup_logits_per_q[q]  # [B, warmup_steps, K]
+            autoreg_q = (
+                torch.cat(autoreg_logits[q], dim=1)
+                if autoreg_logits[q]
+                else torch.empty(
+                    B, 0, self.config.codebook_size,
+                    device=latents.device,
+                )
+            )
+            all_logits_per_q.append(
+                torch.cat([warmup_q, autoreg_q], dim=1)
+            )
+
+        return {
+            "predicted_logits_per_codebook": all_logits_per_q,
+            "hidden": hidden,
+        }
 
     def forward(
         self,
@@ -330,8 +444,8 @@ class RNNDACModel(nn.Module):
         cond: Optional[torch.Tensor] = None,
         hidden: Optional[torch.Tensor] = None,
         target_codes: Optional[torch.Tensor] = None,
-        cascade_mode: CascadeMode = "soft",
-        return_expected_vectors: bool = True,
+        cascade_mode: CascadeMode = "free",
+        tau: Optional[float] = None,
     ) -> Dict[str, torch.Tensor | List[torch.Tensor] | None]:
         """
         Args:
@@ -339,14 +453,14 @@ class RNNDACModel(nn.Module):
             cond: [B, T, cond_size]
             hidden: [num_layers, B, hidden_size]
             target_codes: [B, T, n_q], required for cascade_mode='teacher'
-            cascade_mode: 'teacher' | 'soft' | 'hard'
-            return_expected_vectors: include the per-codebook 8D vectors used/generated in the cascade
+            cascade_mode: 'teacher' | 'free'
+            tau: softmax temperature (default: self.config.tau)
 
         Returns dict with:
-            logits_per_codebook: list[n_q] of [B, T, codebook_size]
+            predicted_logits_per_codebook: list[n_q] of [B, T, codebook_size]
+            cascade_vectors: list[n_q] of [B, T, codebook_dim] (normalized)
             hidden: [num_layers, B, hidden_size]
             rnn_out: [B, T, hidden_size]
-            expected_vectors_per_codebook: list[n_q] of [B, T, codebook_dim] or None
         """
         if latents.ndim != 3:
             raise ValueError(f"latents must have shape [B, T, D], got {tuple(latents.shape)}")
@@ -376,17 +490,19 @@ class RNNDACModel(nn.Module):
 
         x = self._prepare_inputs(latents, cond)
         rnn_out, hidden_out = self.gru(x, hidden)
-        logits_per_q, vecs_per_q = self._run_codebook_cascade(
+        rnn_out = self.rnn_dropout(rnn_out)  # training-only dropout for head robustness
+        logits_per_q, cascade_vectors = self._run_codebook_cascade(
             rnn_out,
             cascade_mode=cascade_mode,
             target_codes=target_codes,
+            tau=tau,
         )
 
         return {
-            "logits_per_codebook": logits_per_q,
+            "predicted_logits_per_codebook": logits_per_q,
+            "cascade_vectors": cascade_vectors,
             "hidden": hidden_out,
             "rnn_out": rnn_out,
-            "expected_vectors_per_codebook": vecs_per_q if return_expected_vectors else None,
         }
 
     @torch.no_grad()
@@ -396,8 +512,9 @@ class RNNDACModel(nn.Module):
         cond_t: Optional[torch.Tensor] = None,
         hidden: Optional[torch.Tensor] = None,
         target_codes_t: Optional[torch.Tensor] = None,
-        cascade_mode: CascadeMode = "soft",
-        return_expected_vectors: bool = True,
+        cascade_mode: CascadeMode = "free",
+        tau: float = 0.0,
+        top_k: int = 0,
     ) -> Dict[str, torch.Tensor | List[torch.Tensor] | None]:
         """
         Single-timestep convenience wrapper.
@@ -407,24 +524,55 @@ class RNNDACModel(nn.Module):
             cond_t: [B, cond_size]
             hidden: [num_layers, B, hidden_size]
             target_codes_t: [B, n_q] when cascade_mode='teacher'
+            tau: softmax temperature (default 0 = argmax).
+            top_k: keep only top-k logits before sampling (0 = disabled).
         """
         if latent_t.ndim != 2:
             raise ValueError(f"latent_t must have shape [B, D], got {tuple(latent_t.shape)}")
         latents = latent_t.unsqueeze(1)
         cond = cond_t.unsqueeze(1) if cond_t is not None else None
         target_codes = target_codes_t.unsqueeze(1) if target_codes_t is not None else None
-        return self.forward(
+        out = self.forward(
             latents=latents,
             cond=cond,
             hidden=hidden,
             target_codes=target_codes,
             cascade_mode=cascade_mode,
-            return_expected_vectors=return_expected_vectors,
+            tau=tau,
         )
+
+        # Convert logits → vectors with optional top-k + temperature sampling
+        logits_per_q = out["predicted_logits_per_codebook"]
+        vecs = []
+        for q, logits_q in enumerate(logits_per_q):
+            logits_q = logits_q.squeeze(1)  # [B, K]
+
+            if top_k > 0:
+                top_k_vals, _ = logits_q.topk(top_k, dim=-1)
+                logits_q = logits_q.masked_fill(
+                    logits_q < top_k_vals[..., -1:], float('-inf')
+                )
+
+            if tau > 0:
+                probs = F.softmax(logits_q / tau, dim=-1)
+                idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            else:
+                idx = logits_q.argmax(dim=-1)
+
+            vec = self.codebook_vectors[q][idx] / self.config.clamp_val
+            vecs.append(vec)
+        pred_vectors = torch.stack(vecs, dim=1)  # [B, n_q, D], normalized
+
+        return {
+            "predicted_vectors_per_codebook": pred_vectors,
+            "predicted_logits_per_codebook": out["predicted_logits_per_codebook"],
+            "hidden": out["hidden"],
+            "rnn_out": out["rnn_out"],
+        }
 
     def compute_loss(
         self,
-        logits_per_codebook: List[torch.Tensor],
+        predicted_logits: List[torch.Tensor],
         target_codes: torch.Tensor,
         quantizer_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor | List[torch.Tensor]]:
@@ -434,18 +582,18 @@ class RNNDACModel(nn.Module):
             raise ValueError(
                 f"target_codes last dim must equal n_q={self.config.n_q}, got {target_codes.shape[-1]}"
             )
-        if len(logits_per_codebook) != self.config.n_q:
+        if len(predicted_logits) != self.config.n_q:
             raise ValueError(
-                f"Expected {self.config.n_q} logits tensors, got {len(logits_per_codebook)}"
+                f"Expected {self.config.n_q} logit tensors, got {len(predicted_logits)}"
             )
 
+        K = self.config.codebook_size
         losses: List[torch.Tensor] = []
-        for q, logits_q in enumerate(logits_per_codebook):
-            B, T, K = logits_q.shape
-            target_q = target_codes[:, :, q].reshape(B * T)
+        for q, logits_q in enumerate(predicted_logits):
+            targets_q = target_codes[:, :, q].long()          # [B, T]
             loss_q = F.cross_entropy(
-                logits_q.reshape(B * T, K),
-                target_q.long(),
+                logits_q.reshape(-1, K),
+                targets_q.reshape(-1),
                 reduction="mean",
             )
             losses.append(loss_q)
@@ -489,11 +637,10 @@ class RNNDACModelNoCascade(RNNDACModel):
     ) -> None:
         super().__init__(config=config, dac_model=dac_model, codebook_vectors=codebook_vectors)
 
-        # Replace the variable-width cascade heads from the base class with
-        # fixed-width heads that depend only on the GRU output and cond.
-        head_cond_dim = config.cond_size if config.cond_size > 0 else 0
+        # Fixed-width heads depending only on GRU output (cond already injected
+        # into RNN input via _prepare_inputs, so it's in the hidden state).
         self.heads = nn.ModuleList([
-            nn.Linear(config.hidden_size + head_cond_dim, config.codebook_size)
+            nn.Linear(config.hidden_size, config.codebook_size)
             for _ in range(config.n_q)
         ])
 
@@ -502,7 +649,7 @@ class RNNDACModelNoCascade(RNNDACModel):
         rnn_out: torch.Tensor,
         cascade_mode: CascadeMode,
         target_codes: Optional[torch.Tensor] = None,
-        cond: Optional[torch.Tensor] = None,
+        tau: Optional[float] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Predict each codebook independently from the shared RNN representation.
@@ -511,37 +658,34 @@ class RNNDACModelNoCascade(RNNDACModel):
             rnn_out: [B, T, H]
             cascade_mode: accepted for API compatibility, ignored
             target_codes: accepted for API compatibility, ignored
-            cond: [B, T, cond_size] or None
+            tau: softmax temperature (default: self.config.tau)
 
         Returns:
-            logits_per_q: list of n_q tensors, each [B, T, K]
-            vecs_per_q: list of n_q tensors, each [B, T, D]
-                Each vector is the expected 8D vector derived from that head's logits,
-                returned only for inspection/debugging.
+            logits_per_q: list of n_q tensors, each [B, T, codebook_size]
+            cascade_vectors: list of n_q tensors, each [B, T, codebook_dim]
+                             (normalized, used for API consistency)
         """
+        cfg = self.config
         B, T, H = rnn_out.shape
-        N = B * T
-        rnn_flat = rnn_out.reshape(N, H)
-        cond_flat = cond.reshape(N, -1) if cond is not None else None
+        tau = tau if tau is not None else cfg.tau
 
-        logits_per_q_flat: List[torch.Tensor] = []
-        vecs_per_q_flat: List[torch.Tensor] = []
+        logits_per_q: List[torch.Tensor] = []
+        cascade_vectors: List[torch.Tensor] = []
 
-        for q in range(self.config.n_q):
-            parts = [rnn_flat]
-            if cond_flat is not None:
-                parts.append(cond_flat)
-            head_in = torch.cat(parts, dim=-1)
-            logits_q = self.heads[q](head_in)  # [N, K]
-            logits_per_q_flat.append(logits_q)
+        for q in range(cfg.n_q):
+            logits_q = self.heads[q](rnn_out)  # [B, T, K]
+            logits_per_q.append(logits_q)
 
-            # Returned for inspection/debugging only; not used by any later head.
-            vec_q = self._expected_vector(logits_q, q)
-            vecs_per_q_flat.append(vec_q)
+            if self.training:
+                probs = F.softmax(logits_q / tau, dim=-1)
+                vec_raw = probs @ self.codebook_vectors[q]  # [B, T, D]
+            else:
+                idx = logits_q.argmax(dim=-1)                # [B, T]
+                vec_raw = self.codebook_vectors[q][idx]      # [B, T, D]
 
-        logits_per_q = [x.reshape(B, T, self.config.codebook_size) for x in logits_per_q_flat]
-        vecs_per_q = [x.reshape(B, T, self.config.codebook_dim) for x in vecs_per_q_flat]
-        return logits_per_q, vecs_per_q
+            cascade_vectors.append(vec_raw / cfg.clamp_val)
+
+        return logits_per_q, cascade_vectors
 
 
 __all__ = [

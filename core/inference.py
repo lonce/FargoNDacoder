@@ -125,48 +125,28 @@ def pool_snap(
     return snapped_vecs, snapped_idxs
 
 
-def sample_logits_topk(logits, top_k=1, temperature=1.0):
-    """
-    logits: [N, K]
-    returns indices: [N]
-    """
-    if temperature != 1.0:
-        logits = logits / temperature
-
-    if top_k is not None:
-        values, indices = torch.topk(logits, top_k, dim=-1)
-        masked = torch.full_like(logits, float('-inf'))
-        masked.scatter_(dim=-1, index=indices, src=values)
-        logits = masked
-
-    probs = torch.softmax(logits, dim=-1)
-    idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
-    return idx
-
-
 def generate_latent_hop(
     rnn_model,
     latent_t,           # [B, n_q*8]
     cond_hop,           # [B, hop_size, p]
     hidden,
-    top_k=5,
-    temperature=0.5,
-    cascade_mode="soft",
-    pool=None,
-    pool_cond_index=0,
-    pool_n_bins=100,
-    pool_widen=1,
+    cascade_mode="free",
+    tau=0.0,
+    top_k=0,
 ):
     """
     Generate hop_size frames autoregressively.
 
-    If pool is provided, CB0 expected 8D vectors (from logits) are snapped
-    to the nearest observed pool vector in Euclidean space.  This keeps
-    CB0 in-distribution for the current conditioning value.
+    Each step samples from the predicted logits with optional
+    top-k + temperature controls.
+
+    Args:
+        tau: softmax temperature (0 = argmax).
+        top_k: keep only top-k logits before sampling (0 = disabled).
 
     Returns:
         latents_out: [B, hop_size, n_q*8]
-        codes_out:   [B, hop_size, n_q]
+        vectors_out: [B, hop_size, n_q, D]   (predicted 8D vectors per codebook)
         hidden
     """
     B, hop_size, _ = cond_hop.shape
@@ -174,65 +154,39 @@ def generate_latent_hop(
     D = rnn_model.config.codebook_dim
 
     latents_out = []
-    codes_out = []
+    vecs_per_step = []
 
     for t in range(hop_size):
         cond_t = cond_hop[:, t, :]  # [B, p]
 
-        # Normalize to [-1, 1] to match training-time input distribution
-        normed_latent_t = torch.clamp(latent_t, -rnn_model.config.clamp_val,
-                                       rnn_model.config.clamp_val) / rnn_model.config.clamp_val
+        latent_t = torch.clamp(latent_t, -1.0, 1.0)
         out = rnn_model.forward_step(
-            latent_t=normed_latent_t,
+            latent_t=latent_t,
             cond_t=cond_t,
             hidden=hidden,
             cascade_mode=cascade_mode,
+            tau=tau,
+            top_k=top_k,
         )
 
-        logits_per_q = out["logits_per_codebook"]
+        preds_per_q = out["predicted_vectors_per_codebook"]
+        # Each is [B, 1, D] → squeeze to [B, D]
+        vecs_q = [p.squeeze(1) for p in preds_per_q]
         hidden = out["hidden"]
 
-        codes_t = []
-        vecs_t = []
+        # stack → [B, n_q, D]
+        vecs_t = torch.stack(vecs_q, dim=1)
 
-        for q, logits_q in enumerate(logits_per_q):
-            # logits_q: [B, 1, K] → flatten
-            logits_q = logits_q.squeeze(1)
-            codebook = rnn_model.codebook_vectors[q]  # [K, 8]
-
-            if pool is not None and q == 0:
-                # Soft expected 8D vector → snap to nearest pool vector
-                probs = torch.softmax(logits_q, dim=-1)
-                expected_vec = probs @ codebook  # [B, 8]
-                cond_vals = cond_t[:, pool_cond_index]  # [B]
-                vec_q, idx = pool_snap(
-                    pool, expected_vec, cond_vals,
-                    pool_n_bins, widen=pool_widen, q=0,
-                )
-            else:
-                idx = sample_logits_topk(
-                    logits_q,
-                    top_k=top_k,
-                    temperature=temperature,
-                )
-                vec_q = codebook[idx]  # [B, 8]
-
-            codes_t.append(idx)
-            vecs_t.append(vec_q)
-
-        # stack codebooks → [B, n_q, 8]
-        vecs_t = torch.stack(vecs_t, dim=1)
-
-        # flatten → [B, n_q*8]
+        # flatten → [B, n_q*D] for next input
         latent_t = vecs_t.reshape(B, n_q * D)
 
         latents_out.append(latent_t)
-        codes_out.append(torch.stack(codes_t, dim=1))
+        vecs_per_step.append(vecs_t)
 
-    latents_out = torch.stack(latents_out, dim=1)
-    codes_out = torch.stack(codes_out, dim=1)
+    latents_out = torch.stack(latents_out, dim=1)        # [B, hop_size, n_q*D]
+    vecs_per_step = torch.stack(vecs_per_step, dim=1)     # [B, hop_size, n_q, D]
 
-    return latents_out, codes_out, hidden
+    return latents_out, vecs_per_step, hidden
 
 
 #------------------------------------------------------------------
@@ -244,13 +198,10 @@ def infer_streaming_with_lookahead(
     chunk_size,
     hop_size,
     right_context,
-    top_k=5,
-    temperature=0.5,
     frame_samples=512,
-    pool=None,
-    pool_cond_index=0,
-    pool_n_bins=100,
-    pool_widen=1,
+    cascade_mode="free",
+    tau=0.0,
+    top_k=0,
 ):
     """
     Full streaming RNNDAC inference.
@@ -283,12 +234,9 @@ def infer_streaming_with_lookahead(
         latent_t,
         cond0,
         hidden,
+        cascade_mode=cascade_mode,
+        tau=tau,
         top_k=top_k,
-        temperature=temperature,
-        pool=pool,
-        pool_cond_index=pool_cond_index,
-        pool_n_bins=pool_n_bins,
-        pool_widen=pool_widen,
     )
 
     latent_buffer.append(init_latents)
@@ -309,12 +257,9 @@ def infer_streaming_with_lookahead(
             latent_buffer[-1][:, -1, :],  # last frame
             cond_hop,
             hidden,
+            cascade_mode=cascade_mode,
+            tau=tau,
             top_k=top_k,
-            temperature=temperature,
-            pool=pool,
-            pool_cond_index=pool_cond_index,
-            pool_n_bins=pool_n_bins,
-            pool_widen=pool_widen,
         )
 
         latent_buffer.append(new_latents)
@@ -342,8 +287,8 @@ def infer_streaming_with_lookahead(
             pad = z_chunk[:, -1:, :].expand(B, win_end - src_end, -1)
             z_chunk = torch.cat([z_chunk, pad], dim=1)
 
-        # reshape → DAC format
-        z_chunk = z_chunk.transpose(1, 2)  # [B, n_q*8, T]
+        # reshape → DAC format, un-normalize × clamp_val
+        z_chunk = (z_chunk * rnn_model.config.clamp_val).transpose(1, 2)  # [B, n_q*8, T]
 
         z_proj, _, _ = dac_model.quantizer.from_latents(z_chunk)
         audio_chunk = dac_model.decode(z_proj)
